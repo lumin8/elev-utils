@@ -17,7 +17,7 @@ const (
 func main() {
 
         // TEST #1, retrieve elevation for single point
-        z, err := srtm.ElevationFromLatLon(demdir,lat,lon)
+        z, err := srtm.ElevationFromLatLon(lat,lon)
         if err != nil {
                 fmt.Printf("%s",err.Error())
         }
@@ -33,12 +33,13 @@ func main() {
         bbox["ly"] = 45.632871032352256
         bbox["uy"] = 45.643193073481086
 
-	boxptcloud, err := srtm.ElevationFromBBOX(demdir,bbox)
+	fmt.Printf("\n--Test #2 ElevationFromBBOX--\n")
+
+	boxptcloud, err := srtm.ElevationFromBBOX(bbox)
         if err != nil {
                 fmt.Printf("%s",err.Error())
         }
 
-	fmt.Printf("\n--Test #2 ElevationFromBBOX--\n")
 	fmt.Printf("Number of bbox elevation 3D coords: %v\n",len(boxptcloud))
 	fmt.Printf("Sample of first bbox 3D coord: %v\n",boxptcloud[0])
 	fmt.Printf("Sample of last bbox 3D coord: %v\n",boxptcloud[len(boxptcloud)-1])
@@ -46,12 +47,14 @@ func main() {
 	// TEST #3, retrieve 3D pointcloud from float polygon
 	var floatpolygon [][][]float64
 	json.Unmarshal([]byte(floatpolygonstr), &floatpolygon)
-	polyptcloud, err := srtm.ElevationFromPolygon(demdir,floatpolygon)
+
+	fmt.Printf("\n--Test #3 ElevationFromPolygon (poly as float)--\n")
+
+	polyptcloud, err := srtm.ElevationFromPolygon(floatpolygon)
         if err != nil {
                 fmt.Printf("%s",err.Error())
         }
 
-	fmt.Printf("\n--Test #3 ElevationFromPolygon (poly as float)--\n")
 	fmt.Printf("Number of polygon elevation 3D coords: %v\n",len(polyptcloud))
 	fmt.Printf("Sample of first polygon contains 3D coord: %v\n",polyptcloud[0])
 	fmt.Printf("Sample of last polygon contains 3D coord: %v\n",polyptcloud[len(polyptcloud)-1])
