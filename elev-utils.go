@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	"cloud.google.com/go/storage"
 	"github.com/bobg/gcsobj"
@@ -31,12 +30,15 @@ const (
 )
 
 var (
-	ctx context.Context
-	cli *storage.Client
+	// initialize a project wide scope client request
+	cli storage.Client
+
+	// create a project-wide accessible temp data storage
+	srtmTiles = make(map[string]srtmTile)
 )
 
-// SrtmTile holds file path and details of a single SRTM file (...which are themselves 'Tiles')
-type SrtmTile struct {
+// SrtmTile holds file path and details of a single SRTM request
+type srtmRequest struct {
 	Latitude   int
 	Longitude  int
 	Name       string
@@ -46,17 +48,19 @@ type SrtmTile struct {
 	Size       int64
 }
 
-type Point struct {
-	X, Y float64
-}
-
-type ElevPoint struct {
-	X, Y, Z float64
+// srtmTile holds the data for each tile
+type srtmTile struct {
+	Name       string
+	Dir        string
+	Path       string
+	SquareSize int
+	Size       int64
+	Data       []byte
 }
 
 // create Google Storage client (cli) and bucket (bkt)
 func init() {
-	ctx = context.Background()
+	ctx := context.Background()
 	cli, err := storage.NewClient(ctx)
 	if err != nil {
 		fmt.Println("Fata error: %s", err.Error())
@@ -66,7 +70,7 @@ func init() {
 
 // ElevationFromLatLon is main handler for a single lat lon input
 func ElevationFromLatLon(lat, lon float64) (float64, error) {
-	srtm, err := getSrtm(lat, lon)
+	srtm, err := makeSrtm(lat, lon)
 	if err != nil {
 		return math.NaN(), err
 	}
@@ -116,29 +120,24 @@ func ElevationFromBBOX(bbox map[string]float64) ([][]float64, error) {
 	// combine all the possible x,y combinations
 	var ptcloud [][]float64
 
-	var wg sync.WaitGroup
-
 	for _, lon := range xrange {
+		lonRnd := float64(int(lon*10000000)) / 10000000
+
 		for _, lat := range yrange {
+			latRnd := float64(int(lat*10000000)) / 10000000
+
 			// look up the elevation value for each point
-			wg.Add(1)
-			go func(glat float64, glon float64) {
-				defer wg.Done()
+			z, err := ElevationFromLatLon(latRnd, lonRnd)
 
-				z, err := ElevationFromLatLon(glat, glon)
-
-				if err != nil {
-					fmt.Errorf("Not Fatal: [ElevationFromLatLon] in [ElevationFromBBOX] %v", err)
-				} else {
-					// apend the elevation to the point
-					fmt.Printf("Appended point to cloud: %v", []float64{glon, glat, z})
-					ptcloud = append(ptcloud, []float64{glon, glat, z})
-				}
-			}(lat,lon)
+			if err != nil {
+				fmt.Errorf("Not Fatal: [ElevationFromLatLon] in [ElevationFromBBOX] %v", err)
+			} else {
+				// apend the elevation to the point
+				//fmt.Printf("Appended point to cloud: %v", []float64{lon, lat, z})
+				ptcloud = append(ptcloud, []float64{lonRnd, latRnd, z})
+			}
 		}
 	}
-
-	wg.Wait()
 
 	return ptcloud, nil
 
@@ -162,7 +161,11 @@ func ElevationFromPolygon(polygon [][][]float64) ([][]float64, error) {
 		for _, coord := range feature {
 
 			// make sure projection is 4326!
-			lon, lat := To4326(coord[0], coord[1])
+			lonBig, latBig := To4326(coord[0], coord[1])
+
+			lon := float64(int(lonBig*10000000)) / 10000000
+			lat := float64(int(latBig*10000000)) / 10000000
+
 
 			// also, make sure each poly point gets included in the elev lookup array
 			z, err := ElevationFromLatLon(lat, lon)
@@ -247,13 +250,13 @@ func IsPointInsideMultiPolygon(feature [][][][]float64, floatpt []float64) bool 
 	return false
 }
 
-// getSrtm is a specific handler for filling in details of a single SRTM Tile
-func getSrtm(lat, lon float64) (SrtmTile, error) {
-	var srtm SrtmTile
+// makeSrtm is a specific handler for filling in details of a single SRTM tile and request
+func makeSrtm(lat, lon float64) (srtmRequest, error) {
+	var srtm srtmRequest
 
 	srtm.Dir = demdir
 
-	srtm.getSrtmFileName(lat, lon)
+	srtm.makeSrtmFileName(lat, lon)
 
 	err := srtm.getSquareSize()
 	if err != nil {
@@ -263,20 +266,9 @@ func getSrtm(lat, lon float64) (SrtmTile, error) {
 	return srtm, nil
 }
 
-// getElevationFromSrtm is a specific handler for elevation, if SRTM details are known
-func (self *SrtmTile) getElevationFromSrtm(lat, lon float64) (float64, error) {
-	row, column := self.getRowAndColumn(lat, lon)
-
-	elevation, err := self.getElevationFromRowAndColumn(row, column)
-	if err != nil {
-		return elevation, fmt.Errorf("elevation is %v for lat long of %v, %v", elevation, lat, lon)
-	}
-
-	return elevation, nil
-}
-
 // SRTM compliance prescribes distinct filenames eg. S56W072.hgt
-func (self *SrtmTile) getSrtmFileName(lat, lon float64) {
+// ONLY CALLED FROM makeSrtm
+func (self *srtmRequest) makeSrtmFileName(lat, lon float64) {
 	y := "S"
 	if lat >= 0 {
 		y = "N"
@@ -298,11 +290,22 @@ func (self *SrtmTile) getSrtmFileName(lat, lon float64) {
 // the SquareSize determines the density of integers from the hgt file
 // Each 3-arc-second data tile has 1442401 integers representing a 1201×1201 grid
 // Each 1-arc-second data tile has 12967201 integers representing a 3601×3601 grid
-func (self *SrtmTile) getSquareSize() error {
+// ONLY CALLED FROM makeSrtm
+func (self *srtmRequest) getSquareSize() error {
+
+	// check to see if tile is already available
+	_, ok := srtmTiles[self.Name]
+	if ok {
+		self.Size = srtmTiles[self.Name].Size
+		self.SquareSize = srtmTiles[self.Name].SquareSize
+		return nil
+	}
+
+	// otherwise, fetch remotely
 	ctxy := context.Background()
 	cli, err := storage.NewClient(ctxy)
 	if err != nil {
-		fmt.Println("Fata error: %s", err.Error())
+		fmt.Println("Fatal error: %s", err.Error())
 	}
 	defer cli.Close()
 
@@ -330,9 +333,22 @@ func (self *SrtmTile) getSquareSize() error {
 	return nil
 }
 
+// getElevationFromSrtm is a specific handler for elevation
+// calls row and column in place of lat and lon
+func (self *srtmRequest) getElevationFromSrtm(lat, lon float64) (float64, error) {
+	row, column := self.getRowAndColumn(lat, lon)
+
+	elevation, err := self.getElevationFromRowAndColumn(row, column)
+	if err != nil {
+		return elevation, fmt.Errorf("elevation is %v for lat long of %v, %v", elevation, lat, lon)
+	}
+
+	return elevation, nil
+}
+
 // getRowAndColumn calculates the lookup []byte in the grid
 // NOTE: row and column are int, therefore become FLOOR rounded values
-func (self *SrtmTile) getRowAndColumn(lat, lon float64) (int, int) {
+func (self *srtmRequest) getRowAndColumn(lat, lon float64) (int, int) {
 	var row, column int
 
 	if lat >= 0 {
@@ -350,30 +366,33 @@ func (self *SrtmTile) getRowAndColumn(lat, lon float64) (int, int) {
 	return row, column
 }
 
-// find the elevation value associated with the row and column
-func (self *SrtmTile) getElevationFromRowAndColumn(row, column int) (float64, error) {
+// getElevationFromRowAndColumn reads file, grabs elev associated with the byte row and column
+// This is the fxtn that actually does the elev lookup work; optimize HERE
+func (self *srtmRequest) getElevationFromRowAndColumn(row, column int) (float64, error) {
 	i := int64(row*self.SquareSize + column)
 
 	// calculate the byte range
 	byteLocation := i * 2
+	byteLocationTo := byteLocation + 2
 
-	// open the file for reading
-	// deprecated, local //f, err := os.Open(self.Path)
-	ctxy := context.Background()
-	cli, err := storage.NewClient(ctxy)
-	bkt := cli.Bucket(bucket_name)
-	obj := bkt.Object(self.Path)
-	f, err := gcsobj.NewReader(ctxy, obj)
+	// make sure the data is available locally
+	err := fetchSrtmTile(self)
 	if err != nil {
 		return math.NaN(), err
 	}
-	defer f.Close()
 
 	// get the results from the byte location
-	_, _ = f.Seek(byteLocation, 0)
-	bytes := make([]byte, 2)
-	response, _ := io.ReadAtLeast(f, bytes, 2)
-	result := bytes[:response]
+	// Deprecated
+	/*
+		_, _ = f.Seek(byteLocation, 0)
+		bytes := make([]byte, 2)
+		response, _ := io.ReadAtLeast(f, bytes, 2)
+		result := bytes[:response]
+	*/
+	//bytes := make([]byte, 2)
+	//response, _ := io.ReadAtLeast(bytes, 2)
+
+	result := srtmTiles[self.Name].Data[byteLocation:byteLocationTo]
 
 	if len(result) != 2 {
 		errstring := fmt.Sprintf("%v", result)
@@ -390,9 +409,45 @@ func (self *SrtmTile) getElevationFromRowAndColumn(row, column int) (float64, er
 		return math.NaN(), fmt.Errorf("result is not logical, encountered float64 value of: %v", float64(final))
 	}
 
-	f.Close()
-
 	return float64(final), nil
+}
+
+// fetchSrtmTile collects the remote tile, adds to srtmTiles array
+func fetchSrtmTile(self *srtmRequest) error {
+	// check if tile already exists locally
+	_, ok := srtmTiles[self.Name]
+	if ok {
+		return nil
+	}
+
+	// fetch if not
+	// build google storage request
+	ctxy := context.Background()
+	cli, err := storage.NewClient(ctxy)
+	bkt := cli.Bucket(bucket_name)
+	obj := bkt.Object(self.Path)
+	f, err := gcsobj.NewReader(ctxy, obj)
+	if err != nil {
+		return fmt.Errorf("elevation is not available for tile %v", self.Name)
+	}
+	defer f.Close()
+
+	// consrtuct the tile
+	var tile srtmTile
+	tile.Name = self.Name
+	tile.Path = self.Path
+	tile.Dir = self.Dir
+	tile.SquareSize = self.SquareSize
+	tile.Size = self.Size
+	data, err := ioutil.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("data was not read into local source tile %v", self.Name)
+	}
+	tile.Data = data
+
+	srtmTiles[tile.Name] = tile
+
+	return nil
 }
 
 // makeRange takes in a min and max value, and builds the range from there
@@ -433,6 +488,7 @@ func Str2Fixed(num string) float64 {
 }
 
 // To4326 converts coordinates to EPSG:4326 projection
+// if 4325 coordinates are passed in, does not affect the originals
 func To4326(x float64, y float64) (float64, float64) {
 	if x > 180 || x < -180 || y > 180 || y < -180 {
 		mercPoint := geo.NewPoint(x, y)
